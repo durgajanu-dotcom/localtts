@@ -1,0 +1,169 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local TTS</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+      .tts-word { white-space: pre; }
+      .tts-highlight { background: yellow; }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container py-5">
+      <h1 class="mb-4">Local TTS</h1>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, msg in messages %}
+            <div class="alert alert-{{category}}">{{msg}}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <form method="post" id="tts-form">
+        <div class="mb-3">
+          <label for="text" class="form-label">Text</label>
+          <textarea class="form-control" id="text" name="text" rows="6" required></textarea>
+        </div>
+        <div class="row mb-3">
+          <div class="col-md-4">
+            <label for="voice" class="form-label">Voice</label>
+            <select class="form-select" id="voice" name="voice">
+              <option value="">Default</option>
+              {% for v in voices %}
+                <option value="{{v.id}}">{{v.name or v.id}}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-6">
+            <label for="speed" class="form-label">Speed: <span id="speed-display">1.00x</span></label>
+            <input type="range" class="form-range" id="speed" name="speed" min="0.75" max="2.0" step="0.05" value="1.0">
+            <div class="form-text">Set playback speed from 0.75x to 2.0x</div>
+          </div>
+        </div>
+        <div class="btn-group" role="group">
+          <button class="btn btn-secondary" type="button" id="play-browser-btn">Play in Browser (client TTS)</button>
+          <button class="btn btn-success" type="button" id="play-server-btn">Play on Server (server audio)</button>
+          <button class="btn btn-secondary" type="button" id="pause-btn" disabled>Pause</button>
+          <button class="btn btn-danger" type="button" id="stop-btn" disabled>Stop</button>
+        </div>
+      </form>
+
+      <div id="word-container" style="margin-top:1rem"></div>
+
+      <hr class="my-4">
+      <p class="text-muted">This app uses your local TTS engine on the server via <code>pyttsx3</code> for server playback, or your browser's Web Speech API for client playback.</p>
+    </div>
+
+    <script>
+      (function(){
+        const textArea = document.getElementById('text');
+        const playBrowserBtn = document.getElementById('play-browser-btn');
+        const playServerBtn = document.getElementById('play-server-btn');
+        const pauseBtn = document.getElementById('pause-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const wordContainer = document.getElementById('word-container');
+        const speedInput = document.getElementById('speed');
+        const speedDisplay = document.getElementById('speed-display');
+
+        speedInput.addEventListener('input', ()=>{ speedDisplay.textContent = parseFloat(speedInput.value).toFixed(2) + 'x'; });
+
+        let audio = null;
+        let timings = []; // array of {start, end, index}
+
+        function renderWords(text){
+          wordContainer.innerHTML = '';
+          const words = text.split(/(\s+)/);
+          for(let i=0;i<words.length;i++){
+            const span = document.createElement('span');
+            span.className = 'tts-word';
+            span.textContent = words[i];
+            wordContainer.appendChild(span);
+          }
+        }
+
+        function clearHighlights(){
+          const spans = wordContainer.querySelectorAll('.tts-word');
+          spans.forEach(s => s.classList.remove('tts-highlight'));
+        }
+
+        // Client-side playback using Web Speech API
+        playBrowserBtn.addEventListener('click', ()=>{
+          const text = textArea.value.trim(); if(!text) return;
+          renderWords(text);
+          clearHighlights();
+          if (window.speechSynthesis) {
+            if (audio){ audio.pause(); audio = null; }
+            const utter = new SpeechSynthesisUtterance(text);
+            const speed = parseFloat(speedInput.value) || 1.0;
+            utter.rate = speed;
+            utter.onboundary = function(e){
+              if (e.name && e.name !== 'word') return;
+              const charIndex = e.charIndex; if (typeof charIndex !== 'number') return;
+              let cum=0; const spans = wordContainer.querySelectorAll('.tts-word');
+              for(let i=0;i<spans.length;i++){ const len = spans[i].textContent.length; if(charIndex>=cum && charIndex < cum+len){ clearHighlights(); spans[i].classList.add('tts-highlight'); break; } cum += len; }
+            };
+            utter.onstart = ()=>{ playBrowserBtn.disabled=true; pauseBtn.disabled=false; stopBtn.disabled=false; };
+            utter.onend = ()=>{ playBrowserBtn.disabled=false; pauseBtn.disabled=true; stopBtn.disabled=true; clearHighlights(); };
+            speechSynthesis.speak(utter);
+          } else {
+            alert('SpeechSynthesis not supported in this browser');
+          }
+        });
+
+        // Server-side playback: fetch /speak and play returned WAV, build timing mapping from text
+        playServerBtn.addEventListener('click', async ()=>{
+          const text = textArea.value.trim(); if(!text) return;
+          renderWords(text);
+          clearHighlights();
+          if (audio){ audio.pause(); audio = null; }
+          playServerBtn.disabled = true; pauseBtn.disabled = false; stopBtn.disabled = false;
+          try{
+            const form = new FormData(); form.append('text', text);
+            form.append('rate', speedInput.value || '1.0');
+            form.append('voice', document.getElementById('voice').value || '');
+            const resp = await fetch('/speak', { method: 'POST', body: form });
+            if(!resp.ok){ const txt = await resp.text(); alert('Server error: '+txt); playServerBtn.disabled=false; pauseBtn.disabled=true; stopBtn.disabled=true; return; }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            audio = new Audio(url);
+            audio.addEventListener('loadedmetadata', ()=>{
+              const duration = audio.duration || 0.001;
+              const spans = Array.from(wordContainer.querySelectorAll('.tts-word'));
+              const lengths = spans.map(s => s.textContent.length);
+              const total = lengths.reduce((a,b)=>a+b,0) || 1;
+              timings = [];
+              let cumTime = 0;
+              for(let i=0;i<spans.length;i++){
+                const portion = lengths[i]/total;
+                const seg = { start: cumTime, end: cumTime + portion*duration, index:i };
+                timings.push(seg);
+                cumTime = seg.end;
+              }
+              audio.play();
+            });
+            audio.addEventListener('timeupdate', ()=>{
+              const t = audio.currentTime;
+              for(const seg of timings){ if(t >= seg.start && t < seg.end){ const spans = wordContainer.querySelectorAll('.tts-word'); clearHighlights(); if(spans[seg.index]) spans[seg.index].classList.add('tts-highlight'); break; } }
+            });
+            audio.addEventListener('ended', ()=>{ playServerBtn.disabled=false; pauseBtn.disabled=true; stopBtn.disabled=true; clearHighlights(); URL.revokeObjectURL(audio.src); audio = null; });
+          }catch(err){ alert('Error: '+err); playServerBtn.disabled=false; pauseBtn.disabled=true; stopBtn.disabled=true; }
+        });
+
+        pauseBtn.addEventListener('click', ()=>{
+          if (audio){ if (audio.paused){ audio.play(); pauseBtn.textContent='Pause'; } else { audio.pause(); pauseBtn.textContent='Resume'; } }
+          else if (speechSynthesis){ if (speechSynthesis.paused){ speechSynthesis.resume(); pauseBtn.textContent='Pause'; } else { speechSynthesis.pause(); pauseBtn.textContent='Resume'; } }
+        });
+
+        stopBtn.addEventListener('click', ()=>{
+          if (audio){ audio.pause(); audio.currentTime = 0; URL.revokeObjectURL(audio.src); audio = null; }
+          if (speechSynthesis){ speechSynthesis.cancel(); }
+          clearHighlights(); playServerBtn.disabled=false; pauseBtn.disabled=true; stopBtn.disabled=true; playBrowserBtn.disabled=false;
+        });
+
+      })();
+    </script>
+  </body>
+</html>
